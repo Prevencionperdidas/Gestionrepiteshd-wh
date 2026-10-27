@@ -625,7 +625,7 @@ body.mode-hd .brand h1{font-size:22px;}
    CONFIGURACIÓN
 ══════════════════════════════════════════════ */
 const DASHBOARD_PIN = '2108';
-const SYNC_URL = 'https://script.google.com/a/macros/ikea.cl/s/AKfycbxB_dyNz09YJSahJU3ANZhC5tV4k9QvjKjx8KS_lsPpOfhk-jkbYN4BfdyUNbaHY7cW/exec';
+const SYNC_URL = 'https://script.google.com/a/macros/ikea.cl/s/AKfycbyx9ncOQdpf_eUPdOVF82_aw2arBDi6sPdpFZsCV3ZMd1juxOA_JQzStoBcoakVwNZ0IA/exec';
 const POLL_PC_MS = 30000, POLL_RF_MS = 60000, SYNC_TIMEOUT_MS = 30000;
 const CACHE_KEY = 'ctrl-repites-cache-v4', PENDING_KEY = 'ctrl-repites-pending-v4', DEVICE_KEY = 'ctrl-repites-device';
 
@@ -727,35 +727,54 @@ const IS_GAS=(()=>{try{return typeof google!=='undefined'&&!!google.script?.run;
 async function callServer(fn,payload){
   if(IS_GAS){
     return new Promise((resolve,reject)=>{
-      const r=google.script.run.withSuccessHandler(resolve).withFailureHandler(err=>reject(new Error(err.message||String(err))));
+      const r=google.script.run
+        .withSuccessHandler(v=>{if(v==null)reject(new Error('El servidor respondió vacío en '+fn+' (revisa que el Code.gs sea la versión nueva).'));else resolve(v);})
+        .withFailureHandler(err=>reject(new Error((err&&err.message)||String(err))));
+      if(typeof r[fn]!=='function'){reject(new Error('La función '+fn+' no existe en el Code.gs publicado. Pega el Code.gs nuevo y publica una Nueva versión.'));return;}
       if(payload!==undefined)r[fn](payload);else r[fn]();
     });
   }
-  const ctrl=typeof AbortController!=='undefined'?new AbortController():null;
-  const timer=ctrl?setTimeout(()=>ctrl.abort(),SYNC_TIMEOUT_MS):null;
-  try{
-    let res;
-    if(fn==='serverGetAll'||fn==='serverConfig'){
-      const u=new URL(SYNC_URL);u.searchParams.set('fn',fn);u.searchParams.set('_',Date.now());
-      res=await fetch(u.toString(),{method:'GET',redirect:'follow',credentials:'omit',signal:ctrl?.signal});
-    }else{
-      res=await fetch(SYNC_URL,{method:'POST',redirect:'follow',credentials:'omit',signal:ctrl?.signal,
-        headers:{'Content-Type':'text/plain;charset=utf-8'},body:JSON.stringify({fn,data:payload})});
-    }
-    if(!res.ok)throw new Error('HTTP '+res.status);
-    const txt=await res.text();const m=txt.match(/\{[\s\S]*\}/);
-    if(!m)throw new Error('Sin respuesta JSON del servidor');
-    return JSON.parse(m[0]);
-  }finally{if(timer)clearTimeout(timer);}
+  return jsonp(fn,payload);
 }
+
+/* JSONP: la conexión se carga como <script>, así viaja la sesión de Google del
+   navegador (cuenta ikea.cl). Funciona con implementaciones restringidas a la
+   empresa y también con acceso "Cualquier usuario". */
+let jsonpSeq=0;
+function jsonp(fn,payload){
+  return new Promise((resolve,reject)=>{
+    const name='__cr_cb_'+Date.now().toString(36)+'_'+(jsonpSeq++);
+    const u=new URL(SYNC_URL);
+    u.searchParams.set('fn',fn);
+    if(payload!==undefined)u.searchParams.set('data',String(payload));
+    u.searchParams.set('callback',name);
+    u.searchParams.set('_',Date.now());
+    const sc=document.createElement('script');
+    let done=false;
+    const finish=()=>{done=true;clearTimeout(timer);try{delete window[name];}catch(e){window[name]=undefined;}sc.remove();};
+    window[name]=data=>{if(done)return;finish();resolve(data);};
+    sc.onerror=()=>{if(done)return;finish();reject(new Error(LOGIN_HINT));};
+    const timer=setTimeout(()=>{if(done)return;finish();reject(new Error('El servidor no respondió a tiempo (revisa la red).'));},SYNC_TIMEOUT_MS);
+    sc.src=u.toString();
+    document.head.appendChild(sc);
+  });
+}
+const LOGIN_HINT='Google no entregó los datos. Inicia sesión con tu cuenta @ikea.cl en este navegador (toca el indicador → "Conectar con Google") o revisa la URL del script.';
 class NetError extends Error{}
 async function call(fn,obj){
   try{return await callServer(fn,obj===undefined?undefined:JSON.stringify(obj));}
   catch(e){throw new NetError(e.message);}
 }
 
-function setSyncStatus(s){
+let lastErr='',lastErrShown='';
+function setSyncStatus(s,msg){
   const el=$('syncIndicator');if(!el)return;
+  if(s==='error'||s==='offline'){
+    lastErr=msg||lastErr||'';
+    if(lastErr&&lastErr!==lastErrShown){lastErrShown=lastErr;showToast('Conexión: '+lastErr);}
+  }else if(s==='ok'){lastErr='';}
+  el.title=lastErr?('Último error: '+lastErr+' · toca para ver detalles'):'Estado de conexión con Google Sheets';
+  el.style.cursor='pointer';
   if(s==='ok'&&pending.length)s='pending';
   const map={off:['● Local','#BBD6EF'],syncing:['● Sincronizando…','#FFDB00'],ok:['● Sincronizado ✓','#7CE2A0'],
     pending:[`● ${pending.length} pendiente${pending.length!==1?'s':''}`,'#FFDB00'],error:['● Error servidor','#FF9FAE'],offline:['● Sin red','#FF9FAE']};
@@ -771,8 +790,11 @@ async function pullAll(){
       STATE={li:r.li||[],hd:r.hd||[],desp:r.desp||[],config:r.config||STATE.config,movements:r.movements||[],serverAt:r.serverAt||nowISO()};
       applyPendingLocally();saveCache();setSyncStatus('ok');renderAll();return true;
     }
-    setSyncStatus('error');return false;
-  }catch(e){setSyncStatus('offline');return false;}
+    setSyncStatus('error',(r&&r.error)||'Respuesta inválida del servidor');return false;
+  }catch(e){
+    // Dentro de Apps Script no es un problema de red: es un error del servidor o de permisos
+    setSyncStatus(IS_GAS?'error':'offline',e.message);return false;
+  }
   finally{pulling=false;}
 }
 
@@ -999,7 +1021,8 @@ async function runTrace(olpn){
 /* ══════════════════════════════════════════════
    CENTRO DE QR (enlaces, ubicaciones, andenes)
 ══════════════════════════════════════════════ */
-function baseUrl(){return IS_GAS?SYNC_URL:(location.origin+location.pathname);}
+let APP_URL='';   // URL real de la app (/exec) informada por el servidor
+function baseUrl(){return IS_GAS?(APP_URL||SYNC_URL):(location.origin+location.pathname);}
 function loadQrLib(){
   if(window.QRCode)return Promise.resolve();
   return new Promise((res,rej)=>{const s=document.createElement('script');s.src='https://cdnjs.cloudflare.com/ajax/libs/qrcodejs/1.0.0/qrcode.min.js';s.onload=res;s.onerror=()=>rej(new Error('No se pudo cargar el generador de QR (revisa la conexión).'));document.head.appendChild(s);});
@@ -1279,6 +1302,28 @@ function exportCSV(){
   a.download=`control-repites-hd-wh-${new Date().toISOString().slice(0,10)}.csv`;document.body.appendChild(a);a.click();a.remove();
 }
 
+/* Diagnóstico de conexión (toca el indicador de estado) */
+async function openConnDiag(){
+  modalOpen=true;$('modal').className='modal';
+  const row=(k,v)=>`<tr><td style="padding:6px 8px;color:var(--ink-soft);white-space:nowrap">${k}</td><td style="padding:6px 8px;font-family:'IBM Plex Mono',monospace;font-size:12px;word-break:break-all">${v}</td></tr>`;
+  $('modal').innerHTML=`<div class="modal-head"><div><h2>🩺 Conexión</h2><div class="stage-tag">Envía una captura de esta ventana si hay problemas</div></div><button class="modal-close" id="cdClose">✕</button></div>
+    <div class="modal-body"><table style="width:100%;border-collapse:collapse;font-size:13px">
+      ${row('Modo',IS_GAS?'Dentro de Apps Script (google.script.run)':'GitHub (JSONP) → '+esc(SYNC_URL))}
+      ${row('Página',esc(IS_GAS?(APP_URL||'—'):location.href))}
+      ${row('Último error',esc(lastErr||'ninguno'))}
+      <tbody id="cdTest">${row('Prueba','Probando conexión…')}</tbody>
+    </table></div>
+    <div class="modal-foot">${IS_GAS?'':'<button class="btn btn-outline" id="cdLogin">🔑 Conectar con Google</button>'}<button class="btn btn-outline" id="cdClose2">Cerrar</button><button class="btn btn-primary" id="cdRetry">⟳ Reintentar</button></div>`;
+  $('overlay').classList.add('show');
+  $('cdClose').addEventListener('click',closeModal);$('cdClose2').addEventListener('click',closeModal);
+  $('cdLogin')?.addEventListener('click',()=>{window.open(SYNC_URL+'?fn=ping','_blank');showToast('Inicia sesión con tu cuenta @ikea.cl en la pestaña nueva y luego vuelve y toca Reintentar.');});
+  $('cdRetry').addEventListener('click',()=>{closeModal();pullAll().then(ok=>showToast(ok?'Conectado ✓':'Sigue fallando: '+lastErr));});
+  let html;
+  try{const r=await call('serverInfo');html=r&&r.ok?row('Prueba','✅ Servidor OK · planilla: '+esc(r.sheet||'—'))+row('URL app',esc(r.url||'—')):row('Prueba','❌ '+esc((r&&r.error)||'respuesta inválida'));}
+  catch(e){html=row('Prueba','❌ '+esc(e.message));}
+  const t=$('cdTest');if(t)t.innerHTML=html;
+}
+
 /* ══════════════════════════════════════════════
    INIT
 ══════════════════════════════════════════════ */
@@ -1296,6 +1341,7 @@ async function init(){
   if(MODE)initScanner();
   renderAll();
 
+  $('syncIndicator').addEventListener('click',openConnDiag);
   $('btnDashboard').addEventListener('click',()=>withPin(openDashboard));
   $('btnQr').addEventListener('click',()=>withPin(openQrCenter));
   $('btnRefresh').addEventListener('click',async()=>{$('btnRefresh').disabled=true;const ok=await pullAll();$('btnRefresh').disabled=false;showToast(ok?'Datos actualizados ✓':'No se pudo conectar con Google Sheets');});
@@ -1316,6 +1362,7 @@ async function init(){
     catch(e){showToast('Sin conexión con Google Sheets');}finally{b.disabled=false;}
   });
 
+  if(IS_GAS){try{const i=await call('serverInfo');if(i&&i.url)APP_URL=i.url;}catch(e){}}
   await pullAll();
   flushPending();
   setInterval(()=>{pullAll().then(ok=>{if(ok)flushPending();});},MODE?POLL_RF_MS:POLL_PC_MS);
